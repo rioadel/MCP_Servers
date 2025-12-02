@@ -1,0 +1,86 @@
+﻿@page "/mcp-chat"
+@using MCP_Client_UI.Services
+@inject McpAgentService AgentService
+@implements IAsyncDisposable
+
+<h3>MCP Local Agent Chat</h3>
+
+<div class="chat-container" style="height: 400px; overflow-y: auto; border: 1px solid #ccc; padding: 10px; margin-bottom: 10px;">
+    @foreach (var msg in Messages)
+    {
+        <div style="margin-bottom: 10px; padding: 5px; background-color: @(msg.IsUser ? "#e1f5fe" : "#f1f8e9")">
+            <strong>@(msg.IsUser ? "You" : "Agent"):</strong>
+            <pre style="white-space: pre-wrap; font-family: inherit; margin: 0;">@msg.Text</pre>
+        </div>
+    }
+
+    @if (IsThinking)
+    {
+        <div class="text-muted">Agent is thinking and checking tools...</div>
+    }
+</div>
+
+<div class="input-group">
+    <input @bind="CurrentInput" @bind:event="oninput" @onkeyup="HandleKeyUp"
+           class="form-control" placeholder="Ask your database..." disabled="@IsThinking" />
+    <button class="btn btn-primary" @onclick="SendMessage" disabled="@IsThinking">Send</button>
+</div>
+
+@code {
+    private string CurrentInput = "";
+    private bool IsThinking = false;
+    private List<ChatMessage> Messages = new();
+
+    protected override async Task OnInitializedAsync()
+    {
+        try
+        {
+            // Connects to the local process immediately when page loads
+            await AgentService.InitializeAsync();
+        }
+        catch (Exception ex)
+        {
+            Messages.Add(new ChatMessage(false, $"Failed to start MCP Server: {ex.Message}"));
+        }
+    }
+
+    private async Task SendMessage()
+    {
+        if (string.IsNullOrWhiteSpace(CurrentInput)) return;
+
+        var userMsg = CurrentInput;
+        CurrentInput = ""; // Clear input
+        Messages.Add(new ChatMessage(true, userMsg));
+        IsThinking = true;
+        StateHasChanged();
+
+        try
+        {
+            var response = await AgentService.SendMessageAsync(userMsg);
+            Messages.Add(new ChatMessage(false, response));
+        }
+        catch (Exception ex)
+        {
+            Messages.Add(new ChatMessage(false, $"Error: {ex.Message}"));
+        }
+        finally
+        {
+            IsThinking = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task HandleKeyUp(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter") await SendMessage();
+    }
+
+    // Service is Scoped, so the DI container disposes it,
+    // but explicit disposal logic in component can be added if needed.
+    public ValueTask DisposeAsync()
+    {
+        return ValueTask.CompletedTask;
+    }
+
+    record ChatMessage(bool IsUser, string Text);
+}

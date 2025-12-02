@@ -1,0 +1,7 @@
+<Solution>
+  <Project Path="MCP-Client-2/MCP-Client-2.csproj" Id="8d7ddd3b-acee-43c6-ad1f-96bfbe647780" />
+  <Project Path="MCP-Client-3/MCP-Client-3.csproj" Id="7c43504a-777a-4c91-9738-4f0e83a5179d" />
+  <Project Path="MCP-Client-UI/MCP-Client-UI.csproj" Id="74eb76e9-7fd7-424f-b502-db149ae32b4d" />
+  <Project Path="MCP-Client/MCP-Client.csproj" Id="b1589915-db2f-4fa6-933a-2348fc3a4d62" />
+  <Project Path="Server_V1/Server_V1.csproj" />
+</Solution>

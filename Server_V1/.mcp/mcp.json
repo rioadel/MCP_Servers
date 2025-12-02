@@ -1,0 +1,13 @@
+﻿{
+  "inputs": [],
+  "servers": {
+    "Server_V1": {
+      "type": "stdio",
+      "command": "dotnet",
+      "args": [
+        "E:\\Mario\\TrialProjects\\MCPForRealCases\\MCP_Servers\\Server_V1\\bin\\Debug\\net10.0\\win-x64\\Server_V1.dll"
+      ],
+      "env": {}
+    }
+  }
+}
