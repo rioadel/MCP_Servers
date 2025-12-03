@@ -53,7 +53,9 @@ namespace MCP_Client_UI.Services
                 _chatClient = InitializeChatClient(settings);
 
                 // 4. Create the Agent with enhanced instructions
-                _agent = CreateAgent(agentTools, toolArgsDetails);
+                // Additional instructions can be added here if needed
+                var instruction = @"if you asked to call any tool number of times do that but the maximum number of iterations is 15"; 
+                _agent = CreateAgent(agentTools, toolArgsDetails, instruction);
 
                 // 5. Initialize default thread
                 _currentThread = _agent.GetNewThread();
