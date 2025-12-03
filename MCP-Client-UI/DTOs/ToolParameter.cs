@@ -1,4 +1,4 @@
-﻿namespace MCP_Client_UI.Models
+﻿namespace MCP_Client_UI.DTOs
 {
     public class ToolParameter
     {

@@ -7,7 +7,7 @@ using OpenAI;
 using OpenAI.Chat;
 using System.ClientModel;
 using System.Collections.Concurrent;
-using MCP_Client_UI.Models;
+using MCP_Client_UI.DTOs;
 
 namespace MCP_Client_UI.Services
 {
