@@ -1,152 +1,246 @@
-﻿    using System.Text.Json;
-    using Microsoft.Agents.AI;
-    using Microsoft.Extensions.AI;
-    using ModelContextProtocol.Client;
-    using ModelContextProtocol.Protocol;
-    using OpenAI;
-    using OpenAI.Chat;
-    using System.ClientModel;
+﻿using System.Text.Json;
+using Microsoft.Agents.AI;
+using Microsoft.Extensions.AI;
+using ModelContextProtocol.Client;
+using ModelContextProtocol.Protocol;
+using OpenAI;
+using OpenAI.Chat;
+using System.ClientModel;
+using System.Collections.Concurrent;
+using MCP_Client_UI.Models;
 
 namespace MCP_Client_UI.Services
 {
-    public class McpAgentService : IAsyncDisposable
+    public class McpAgentService(IConfiguration _config, ILogger<McpAgentService> _logger) : IAsyncDisposable
     {
-        private readonly IConfiguration _config;
+        private readonly SemaphoreSlim _initializationLock = new(1, 1);
+        private readonly ConcurrentDictionary<string, AgentThread> _threadCache = new();
+
         private McpClient? _mcpClient;
         private AIAgent? _agent;
         private AgentThread? _currentThread;
         private IChatClient? _chatClient;
+        private bool _isDisposed;
 
-        // Track if we are initialized to prevent double loading
         public bool IsInitialized { get; private set; }
 
-        public McpAgentService(IConfiguration config)
-        {
-            _config = config;
-        }
+        // Expose available tools for UI or debugging
+        public IReadOnlyList<string> AvailableTools { get; private set; } = Array.Empty<string>();
 
-        public async Task InitializeAsync()
+        public async Task InitializeAsync(CancellationToken cancellationToken = default)
         {
             if (IsInitialized) return;
 
-            var settings = _config.GetSection("McpSettings");
+            await _initializationLock.WaitAsync(cancellationToken);
+            try
+            {
+                if (IsInitialized) return; // Double-check after acquiring lock
 
-            // 1. Setup MCP Client (Stdio)
+                _logger.LogInformation("Initializing MCP Agent Service...");
+
+                var settings = _config.GetSection("McpSettings");
+
+                ValidateConfiguration(settings);
+
+                // 1. Setup MCP Client with retry logic
+                _mcpClient = await InitializeMcpClientAsync(settings, cancellationToken);
+
+                // 2. Fetch and process tools
+                var (agentTools, toolArgsDetails) = await LoadToolsAsync(cancellationToken);
+                AvailableTools = agentTools.Select(t => t.Name).ToList();
+
+                // 3. Setup AI Client
+                _chatClient = InitializeChatClient(settings);
+
+                // 4. Create the Agent with enhanced instructions
+                _agent = CreateAgent(agentTools, toolArgsDetails);
+
+                // 5. Initialize default thread
+                _currentThread = _agent.GetNewThread();
+
+                IsInitialized = true;
+                _logger.LogInformation("MCP Agent Service initialized successfully with {ToolCount} tools", agentTools.Count);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to initialize MCP Agent Service");
+                throw new InvalidOperationException("MCP Agent Service initialization failed. See inner exception for details.", ex);
+            }
+            finally
+            {
+                _initializationLock.Release();
+            }
+        }
+
+        private void ValidateConfiguration(IConfigurationSection settings)
+        {
+            var requiredKeys = new[] { "ServerCommand", "ServerPath", "ApiKey", "ApiUrl", "ModelId" };
+            var missingKeys = requiredKeys.Where(key => string.IsNullOrWhiteSpace(settings[key])).ToList();
+
+            if (missingKeys.Any())
+            {
+                throw new InvalidOperationException(
+                    $"Missing required configuration keys: {string.Join(", ", missingKeys)}");
+            }
+        }
+
+        private async Task<McpClient> InitializeMcpClientAsync(IConfigurationSection settings, CancellationToken cancellationToken)
+        {
             var transportOptions = new StdioClientTransportOptions
             {
-                Command = settings["ServerCommand"] ?? "dotnet",
+                Command = settings["ServerCommand"]!,
                 Arguments = [settings["ServerPath"]!]
             };
 
             var transport = new StdioClientTransport(transportOptions);
 
-            _mcpClient = await McpClient.CreateAsync(transport);
+            _logger.LogDebug("Creating MCP client with command: {Command} {Arguments}",
+                transportOptions.Command,
+                string.Join(" ", transportOptions.Arguments));
 
-            // 2. Fetch Tools from MCP Server
-            var mcpTools = await _mcpClient.ListToolsAsync();
+            var mcpClientOptions = new McpClientOptions();
+            return await McpClient.CreateAsync(transport, mcpClientOptions);
+        }
+
+        private async Task<(List<AITool> Tools, Dictionary<string, Dictionary<string, ToolParameter>> ToolArgs)> LoadToolsAsync(CancellationToken cancellationToken)
+        {
+            var mcpTools  = await _mcpClient!.ListToolsAsync();
             var agentTools = new List<AITool>();
+            var toolArgsDetails = new Dictionary<string, Dictionary<string, ToolParameter>>();
 
-            var toolArgsDetails = new Dictionary<string, Dictionary<string, (string Type, string Description, dynamic? DefaultValue, bool isRequired)>>();
+            _logger.LogInformation("Retrieved {ToolCount} tools from MCP server", mcpTools.Count);
 
-            // Display the retrieved tools
             foreach (var tool in mcpTools)
             {
-                Console.WriteLine($"Tool: [{tool.Name}] - {tool.Description} \n");
+                _logger.LogDebug("Processing tool: {ToolName} - {Description}", tool.Name, tool.Description);
 
-                // Look for the "properties" field
-                // The structure is usually: { "type": "object", "properties": { ... } }
-                if (tool.JsonSchema.ValueKind == JsonValueKind.Object && tool.JsonSchema.TryGetProperty("properties", out JsonElement propertiesElement))
-                {
-                    // Iterate over the properties (The Keys are the argument names)
-                    foreach (JsonProperty prop in propertiesElement.EnumerateObject())
-                    {
-                        string argName = prop.Name;
-                        string argType = "unknown";
-                        string argDescription = "";
-                        dynamic? argDefaultValue = null!;
-                        bool isRequired = false;
+                var parameters = ExtractToolParameters(tool);
+                toolArgsDetails[tool.Name] = parameters;
 
-                        // Get the argument type (e.g., "integer", "string")
-                        if (prop.Value.TryGetProperty("type", out JsonElement typeProp))
-                        {
-                            argType = typeProp.GetString() ?? "unknown";
-                        }
-
-                        // Get the argument description
-                        if (prop.Value.TryGetProperty("description", out JsonElement descProp))
-                        {
-                            argDescription = descProp.GetString() ?? "";
-                        }
-
-                        if (prop.Value.TryGetProperty("default", out JsonElement defaultProp))
-                        {
-                            argDefaultValue = defaultProp.GetRawText();
-                            argDefaultValue = argType == "string" ? defaultProp.GetString() : argDefaultValue;
-                        }
-
-                        // Get the required status if the key is in the "required" array make it true else false
-                        if (tool.JsonSchema.TryGetProperty("required", out JsonElement requiredElement) && requiredElement.ValueKind == JsonValueKind.Array)
-                        {
-                            foreach (JsonElement requiredProp in requiredElement.EnumerateArray())
-                            {
-                                if (requiredProp.GetString() == argName)
-                                {
-                                    isRequired = true;
-                                    break;
-                                }
-                            }
-                        }
-
-                        // Store the argument details
-                        if (!toolArgsDetails.ContainsKey(tool.Name))
-                        {
-                            toolArgsDetails[tool.Name] = new Dictionary<string, (string Type, string Description, dynamic? DefaultValue, bool isRequired)>();
-                        }
-                        toolArgsDetails[tool.Name][prop.Name] = (argType, argDescription, argDefaultValue, isRequired);
-                    }
-                }
-                // We create an AIFunction that, when called by the LLM, 
-                // executes the specific tool on the MCP Client.
-                var aiFunction = AIFunctionFactory.Create(async (JsonElement args) =>
-                {
-                    try
-                    {
-                        // This callback runs when the Agent decides to use the tool
-                        Console.WriteLine($"\n[Agent] Invoking MCP Tool: {tool.Name} with args: {args}\n");
-
-                        // Call the MCP Server
-                        var argsDict = JsonSerializer.Deserialize<Dictionary<string, object?>>(args.GetRawText());
-                        var result = await _mcpClient.CallToolAsync(tool.Name, argsDict);
-
-                        // get Text Content
-                        TextContentBlock textContentBlock = (TextContentBlock)result.Content[0];
-                        var textResult = textContentBlock.Text;
-                        return textResult;
-
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"aiFunction Conversion Error : {ex.Message}");
-                        return $"Error invoking tool {tool.Name}: {ex.Message}";
-                    }
-                },
-                name: tool.Name,
-                description: tool.Description
-                );
+                var aiFunction = CreateAIFunction(tool);
                 agentTools.Add(aiFunction);
             }
 
-            // 3. Setup OpenAI/Gemini Client
+            return (agentTools, toolArgsDetails);
+        }
+
+        private Dictionary<string, ToolParameter> ExtractToolParameters(McpClientTool tool)
+        {
+            var parameters = new Dictionary<string, ToolParameter>();
+
+            if (tool.JsonSchema.ValueKind != JsonValueKind.Object ||
+                !tool.JsonSchema.TryGetProperty("properties", out JsonElement propertiesElement))
+            {
+                return parameters;
+            }
+
+            var requiredParams = new HashSet<string>();
+            if (tool.JsonSchema.TryGetProperty("required", out JsonElement requiredElement) &&
+                requiredElement.ValueKind == JsonValueKind.Array)
+            {
+                foreach (JsonElement req in requiredElement.EnumerateArray())
+                {
+                    if (req.ValueKind == JsonValueKind.String)
+                    {
+                        requiredParams.Add(req.GetString()!);
+                    }
+                }
+            }
+
+            foreach (JsonProperty prop in propertiesElement.EnumerateObject())
+            {
+                var param = new ToolParameter
+                {
+                    Type = prop.Value.TryGetProperty("type", out var typeProp)
+                        ? typeProp.GetString() ?? "unknown"
+                        : "unknown",
+                    Description = prop.Value.TryGetProperty("description", out var descProp)
+                        ? descProp.GetString() ?? ""
+                        : "",
+                    IsRequired = requiredParams.Contains(prop.Name)
+                };
+
+                if (prop.Value.TryGetProperty("default", out JsonElement defaultProp))
+                {
+                    param.DefaultValue = param.Type == "string"
+                        ? defaultProp.GetString()
+                        : defaultProp.GetRawText();
+                }
+
+                parameters[prop.Name] = param;
+
+                _logger.LogTrace("  Parameter: {ParamName} ({Type}, Required: {Required})",
+                    prop.Name, param.Type, param.IsRequired);
+            }
+
+            return parameters;
+        }
+
+        private AITool CreateAIFunction(McpClientTool tool)
+        {
+            return AIFunctionFactory.Create(async (JsonElement args) =>
+            {
+                try
+                {
+                    _logger.LogInformation($"Invoking MCP tool: {tool.Name} - args {args}");
+                    _logger.LogDebug("Tool arguments: {Args}", args.GetRawText());
+
+                    var argsDict = JsonSerializer.Deserialize<Dictionary<string, object?>>(args.GetRawText());
+
+                    var result = await _mcpClient!.CallToolAsync(tool.Name, argsDict);
+
+                    if (result?.Content == null || result.Content.Count == 0)
+                    {
+                        _logger.LogWarning("Tool {ToolName} returned empty result", tool.Name);
+                        return $"Tool '{tool.Name}' executed but returned no content.";
+                    }
+
+                    // Handle multiple content blocks if present
+                    var textResults = result.Content
+                        .OfType<TextContentBlock>()
+                        .Select(block => block.Text)
+                        .ToList();
+
+                    var combinedResult = string.Join("\n", textResults);
+
+                    _logger.LogDebug("Tool {ToolName} result: {Result}",
+                        tool.Name,
+                        combinedResult.Length > 200 ? $"{combinedResult[..200]}..." : combinedResult);
+
+                    return combinedResult;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error invoking tool {ToolName}", tool.Name);
+                    return $"Error invoking tool {tool.Name}: {ex.Message}";
+                }
+            },
+            name: tool.Name,
+            description: tool.Description);
+        }
+
+        private IChatClient InitializeChatClient(IConfigurationSection settings)
+        {
             var apiKey = new ApiKeyCredential(settings["ApiKey"]!);
-            var openAiOptions = new OpenAIClientOptions { Endpoint = new Uri(settings["ApiUrl"]!) };
+            var openAiOptions = new OpenAIClientOptions
+            {
+                Endpoint = new Uri(settings["ApiUrl"]!)
+            };
 
-            // Note: Using OpenAI SDK directly as per your snippet
-            _chatClient = new ChatClient(settings["ModelId"], apiKey, openAiOptions).AsIChatClient();
+            _logger.LogDebug("Initializing chat client with model: {ModelId}", settings["ModelId"]);
 
-            // 4. Create the Agent
-            var toolArgsJson = JsonSerializer.Serialize(toolArgsDetails, new JsonSerializerOptions { WriteIndented = true });
+            return new ChatClient(settings["ModelId"], apiKey, openAiOptions).AsIChatClient();
+        }
 
-            _agent = _chatClient.CreateAIAgent(new ChatClientAgentOptions
+        private AIAgent CreateAgent(List<AITool> agentTools,Dictionary<string, Dictionary<string, ToolParameter>> toolArgsDetails, string agentInstructions = "")
+        {
+            var toolArgsJson = JsonSerializer.Serialize(toolArgsDetails, new JsonSerializerOptions
+            {
+                WriteIndented = true
+            });
+
+            // Keep the original agent instructions as requested
+            return _chatClient!.CreateAIAgent(new ChatClientAgentOptions
             {
                 Name = "DatabaseRetrievalAgent",
                 Instructions = $@"You are a database retrieval agent. Follow these strict rules for tool invocation:
@@ -187,54 +281,129 @@ namespace MCP_Client_UI.Services
                     - Missing required customerId
                     - Response: ""Please provide the customer ID to retrieve""
 
-                    CRITICAL: Parameter names come from toolArgsDetails dictionary ONLY. User provides VALUES only.",
+                    CRITICAL: Parameter names come from toolArgsDetails dictionary ONLY. User provides VALUES only." + agentInstructions,
                 ChatOptions = new() { Tools = agentTools }
             });
-
-            // 5. Start a Thread
-            _currentThread = _agent.GetNewThread(); // Or GetNewThread() depending on version
-
-            IsInitialized = true;
         }
 
-        public async Task<string> SendMessageAsync(string userMessage)
+        public async Task<string> SendMessageAsync(string userMessage,CancellationToken cancellationToken = default)
         {
-            if (!IsInitialized || _agent == null || _currentThread == null)
+            ObjectDisposedException.ThrowIf(_isDisposed, this);
+
+            if (string.IsNullOrWhiteSpace(userMessage))
             {
-                await InitializeAsync();
+                throw new ArgumentException("User message cannot be null or empty", nameof(userMessage));
+            }
+
+            if (!IsInitialized)
+            {
+                await InitializeAsync(cancellationToken);
             }
 
             try
             {
-                // Execute the run
+                _logger.LogInformation("Processing user message: {Message}",
+                    userMessage.Length > 100 ? $"{userMessage[..100]}..." : userMessage);
+
                 var response = await _agent!.RunAsync(userMessage, _currentThread!);
-                return response.ToString();
+                var responseText = response.ToString();
+
+                _logger.LogDebug("Agent response: {Response}",
+                    responseText.Length > 200 ? $"{responseText[..200]}..." : responseText);
+
+                return responseText;
             }
             catch (ClientResultException ex)
             {
-                // Handle OpenAI/Gemini specific errors
+                _logger.LogError(ex, "API error occurred with status: {Status}", ex.Status);
                 var rawResponse = ex.GetRawResponse();
-                var errorBody = rawResponse?.Content.ToString() ?? "No details";
+                var errorBody = rawResponse?.Content.ToString() ?? "No details available";
                 return $"API Error: {ex.Status} - {errorBody}";
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogWarning("Message processing was cancelled");
+                return "Operation was cancelled.";
             }
             catch (Exception ex)
             {
+                _logger.LogError(ex, "Unexpected error processing message");
                 return $"Internal Error: {ex.Message}";
             }
         }
 
-        // Cleanup is critical for Stdio processes!
-        public async ValueTask DisposeAsync()
+        // Create a new thread for isolated conversations
+        public AgentThread CreateNewThread(string? threadId = null)
         {
-            if (_mcpClient != null)
+            ObjectDisposedException.ThrowIf(_isDisposed, this);
+
+            if (!IsInitialized || _agent == null)
             {
-                await _mcpClient.DisposeAsync();
+                throw new InvalidOperationException("Service must be initialized before creating threads");
             }
 
-            // If ChatClient needs disposal (depending on implementation), do it here
-            if (_chatClient is IDisposable disposableChat)
+            var thread = _agent.GetNewThread();
+
+            if (!string.IsNullOrEmpty(threadId))
             {
-                disposableChat.Dispose();
+                _threadCache[threadId] = thread;
+            }
+
+            _logger.LogDebug("Created new agent thread: {ThreadId}", threadId ?? "default");
+            return thread;
+        }
+
+        // Switch to a different thread
+        public bool SwitchThread(string threadId)
+        {
+            if (_threadCache.TryGetValue(threadId, out var thread))
+            {
+                _currentThread = thread;
+                _logger.LogInformation("Switched to thread: {ThreadId}", threadId);
+                return true;
+            }
+
+            _logger.LogWarning("Thread not found: {ThreadId}", threadId);
+            return false;
+        }
+
+        // Reset current thread
+        public void ResetCurrentThread()
+        {
+            if (_agent != null)
+            {
+                _currentThread = _agent.GetNewThread();
+                _logger.LogInformation("Reset current thread");
+            }
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            if (_isDisposed) return;
+
+            _logger.LogInformation("Disposing MCP Agent Service...");
+
+            try
+            {
+                if (_mcpClient != null)
+                {
+                    await _mcpClient.DisposeAsync();
+                }
+
+                if (_chatClient is IDisposable disposableChat)
+                {
+                    disposableChat.Dispose();
+                }
+
+                _initializationLock.Dispose();
+                _threadCache.Clear();
+
+                _isDisposed = true;
+                _logger.LogInformation("MCP Agent Service disposed successfully");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error during disposal");
             }
         }
     }
